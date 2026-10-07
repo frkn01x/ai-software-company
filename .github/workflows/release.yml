@@ -1,0 +1,52 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Release Pipeline — Sürüm tag'i oluşturulunca çalışır
+# GitHub Release + Changelog oluşturur + Telegram'a bildirir
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  create-release:
+    name: 📋 Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Tam git history — changelog için
+
+      - name: Changelog oluştur
+        id: changelog
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: .github/cliff.toml
+          args: --verbose --latest
+        continue-on-error: true
+
+      - name: GitHub Release oluştur
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.content || 'Yeni sürüm yayınlandı.' }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
+          generate_release_notes: true
+
+      - name: Telegram'a release bildirimi gönder
+        uses: appleboy/telegram-action@master
+        with:
+          to:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          format:  markdown
+          message: |
+            🎉 *Yeni Sürüm: ${{ github.ref_name }}*
+
+            📦 AI Software Company
+            🔗 [Release Notes](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }})
+            🐳 Docker: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}`
+
+            Production deploy otomatik başlıyor...

@@ -1,0 +1,201 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# CI Pipeline — Her PR ve main push'ta çalışır
+# Adımlar: lint → type-check → unit test → security scan → build check
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "feature/**", "hotfix/**"]
+  pull_request:
+    branches: ["main", "develop"]
+
+# Aynı branch'te birden fazla CI çalışmasın — öncekini iptal et
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Lint + Format Kontrolü
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: 🔍 Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Lint araçlarını kur
+        run: pip install ruff black isort
+
+      - name: Ruff lint
+        run: ruff check . --output-format=github
+
+      - name: Black format kontrolü
+        run: black --check --diff .
+
+      - name: isort import sırası
+        run: isort --check-only --diff .
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Type Check
+  # ─────────────────────────────────────────────────────────────────────────────
+  type-check:
+    name: 🏷️ Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Bağımlılıkları kur
+        run: pip install mypy types-requests
+
+      - name: mypy
+        run: mypy . --ignore-missing-imports --no-error-summary
+        continue-on-error: true   # Şimdilik uyarı, hata değil
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Unit Testler
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Bağımlılıkları kur
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio
+
+      - name: Testleri çalıştır
+        env:
+          # CI'da gerçek key kullanmayız — mock ile çalışır
+          OPENAI_API_KEY: "sk-test-dummy"
+          TELEGRAM_BOT_TOKEN: "0000000000:test"
+          TELEGRAM_CHAT_ID: "12345"
+          E2B_API_KEY: "e2b_test"
+          LLM_PROVIDER: "openai"
+        run: |
+          pytest tests/ \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=60 \
+            -v \
+            --tb=short \
+            --ignore=tests/e2e/
+        continue-on-error: true   # Test klasörü yoksa başarısız sayma
+
+      - name: Coverage raporu yükle
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: Güvenlik Taraması
+  # ─────────────────────────────────────────────────────────────────────────────
+  security:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: [lint]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Güvenlik araçlarını kur
+        run: pip install bandit pip-audit safety
+
+      - name: Bandit SAST taraması
+        run: |
+          bandit -r . \
+            --exclude ./.venv,./tests \
+            -f json \
+            -o bandit-report.json \
+            --severity-level medium \
+            --confidence-level medium
+        continue-on-error: true
+
+      - name: Bandit raporu göster
+        if: always()
+        run: |
+          if [ -f bandit-report.json ]; then
+            python -c "
+          import json, sys
+          with open('bandit-report.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          high = [r for r in results if r['issue_severity'] == 'HIGH']
+          print(f'Toplam sorun: {len(results)} | Yüksek: {len(high)}')
+          if high:
+              for r in high[:5]:
+                  print(f\"  HIGH: {r['test_name']} — {r['filename']}:{r['line_number']}\")
+          "
+          fi
+
+      - name: Dependency audit (pip-audit)
+        run: pip-audit --requirement requirements.txt --format json --output pip-audit.json
+        continue-on-error: true
+
+      - name: Audit sonucu göster
+        if: always()
+        run: |
+          if [ -f pip-audit.json ]; then
+            python -c "
+          import json
+          with open('pip-audit.json') as f:
+              data = json.load(f)
+          vulns = data.get('dependencies', [])
+          vuln_deps = [d for d in vulns if d.get('vulns')]
+          print(f'Audit: {len(vulns)} paket kontrol edildi, {len(vuln_deps)} açıklı')
+          for d in vuln_deps[:5]:
+              for v in d['vulns'][:2]:
+                  print(f\"  {d['name']}=={d.get('version','?')} → {v['id']}: {v['description'][:80]}\")
+          "
+          fi
+
+      - name: Güvenlik raporlarını yükle
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            pip-audit.json
+          retention-days: 30

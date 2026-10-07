@@ -1,0 +1,81 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dependency Update — Her Pazartesi çalışır, güncel paket sürümlerini kontrol eder
+# Eski/açıklı bağımlılıkları Telegram'a raporlar
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: Dependency Check
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"   # Her Pazartesi 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-dependencies:
+    name: 📦 Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Audit araçlarını kur
+        run: pip install pip-audit safety pip-check-reqs
+
+      - name: pip-audit çalıştır
+        id: audit
+        run: |
+          pip install -r requirements.txt --quiet
+          pip-audit --requirement requirements.txt \
+            --format json \
+            --output audit-report.json \
+            --disable-pip 2>&1 | tail -5 || true
+          VULN_COUNT=$(python3 -c "
+          import json
+          try:
+              with open('audit-report.json') as f:
+                  data = json.load(f)
+              deps = data.get('dependencies', [])
+              count = sum(1 for d in deps if d.get('vulns'))
+              print(count)
+          except: print(0)
+          ")
+          echo "vuln_count=$VULN_COUNT" >> $GITHUB_OUTPUT
+          echo "Açıklı paket sayısı: $VULN_COUNT"
+
+      - name: Güncel olmayan paketleri listele
+        id: outdated
+        run: |
+          pip list --outdated --format=json > outdated.json || echo "[]" > outdated.json
+          OUTDATED_COUNT=$(python3 -c "import json; data=json.load(open('outdated.json')); print(len(data))")
+          echo "outdated_count=$OUTDATED_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Telegram'a haftalık rapor gönder
+        uses: appleboy/telegram-action@master
+        with:
+          to:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          format:  markdown
+          message: |
+            📦 *Haftalık Dependency Raporu*
+
+            🔒 Güvenlik açıkları: `${{ steps.audit.outputs.vuln_count }}`
+            ⬆️ Güncel olmayan paket: `${{ steps.outdated.outputs.outdated_count }}`
+
+            ${{ steps.audit.outputs.vuln_count > 0 && '⚠️ Lütfen pip-audit raporunu kontrol et!' || '✅ Güvenlik açığı yok.' }}
+
+            🔗 [Workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+      - name: Raporları yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-reports-${{ github.run_id }}
+          path: |
+            audit-report.json
+            outdated.json
+          retention-days: 90

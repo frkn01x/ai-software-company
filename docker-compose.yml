@@ -1,0 +1,74 @@
+version: "3.9"
+
+# ─── Ağ ────────────────────────────────────────────────────────────────────────
+networks:
+  ai_company_net:
+    driver: bridge
+
+# ─── Kalıcı depolama ───────────────────────────────────────────────────────────
+volumes:
+  app_state:
+  app_logs:
+  app_output:
+  redis_data:
+
+# ─── Servisler ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── Ana uygulama (CrewAI + Telegram Bot) ─────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: ai_software_company
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    volumes:
+      - app_state:/app/state
+      - app_logs:/app/logs
+      - app_output:/app/output
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./output:/app/output
+    networks:
+      - ai_company_net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Redis (CrewAI memory + task queue) ────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: ai_company_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - ai_company_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

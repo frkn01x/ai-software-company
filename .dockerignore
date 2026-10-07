@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Ortam dosyaları (secret'lar image'a girmesin!)
+.env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+.eggs/
+
+# Virtual env
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Loglar ve state (volume'dan gelir)
+logs/
+state/*.json
+
+# Proje çıktıları (runtime'da oluşur, image'a girmesin)
+output/
+
+# Test dosyaları
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

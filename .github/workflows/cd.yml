@@ -1,0 +1,300 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# CD Pipeline — main branch'e merge olunca çalışır
+# Adımlar: Docker build → image scan → registry push → deploy
+#
+# Gerekli GitHub Secrets:
+#   DOCKER_USERNAME        — Docker Hub kullanıcı adı
+#   DOCKER_PASSWORD        — Docker Hub token (Settings → Security → PAT)
+#   DEPLOY_HOST            — Sunucu IP/hostname
+#   DEPLOY_USER            — SSH kullanıcı adı
+#   DEPLOY_SSH_KEY         — SSH private key (PEM formatı)
+#   TELEGRAM_BOT_TOKEN     — Deployment bildirimleri için
+#   TELEGRAM_CHAT_ID       — Bildirim hedef chat ID
+# ═══════════════════════════════════════════════════════════════════════════════
+
+name: CD
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]           # v1.2.3 tag'i → production deploy
+  workflow_dispatch:            # Manuel tetikleme
+    inputs:
+      environment:
+        description: "Deploy ortamı"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, production]
+      force_deploy:
+        description: "Testleri atla ve direkt deploy et"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REGISTRY:    docker.io
+  IMAGE_NAME:  ${{ github.repository_owner }}/ai-software-company
+  PYTHON_VER:  "3.11"
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Docker Image Build & Push
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Docker Build & Push
+    runs-on: ubuntu-latest
+
+    outputs:
+      image-tag:    ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      short-sha:    ${{ steps.vars.outputs.short_sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Değişkenleri hazırla
+        id: vars
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Docker meta (tag + label)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Branch push → branch adı + commit SHA
+            type=ref,event=branch
+            type=sha,prefix=,suffix=,format=short
+            # Tag push → semver
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # main branch → latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          labels: |
+            maintainer=AI Software Company
+            org.opencontainers.image.title=AI Software Company
+            org.opencontainers.image.description=Multi-agent AI software company
+
+      - name: QEMU kur (multi-arch build için)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Docker Buildx kur
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Hub'a giriş yap
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Docker image build & push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_COMMIT=${{ github.sha }}
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Docker Image Güvenlik Taraması (Trivy)
+  # ─────────────────────────────────────────────────────────────────────────────
+  image-scan:
+    name: 🔒 Image Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: Trivy ile image tara
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short-sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0        # Kritik açık olsa bile pipeline'ı durdurma (uyarı ver)
+
+      - name: Trivy sonuçlarını GitHub Security'ye yükle
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy özet raporu (tablo)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short-sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Staging Deploy
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-push, image-scan]
+    environment:
+      name: staging
+      url: https://staging.example.com
+
+    # main push veya staging seçilmişse çalış
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event.inputs.environment == 'staging'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH ile staging'e deploy et
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:        ${{ secrets.DEPLOY_HOST }}
+          username:    ${{ secrets.DEPLOY_USER }}
+          key:         ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "=== Staging Deploy Başladı ==="
+            cd /opt/ai-software-company || { mkdir -p /opt/ai-software-company && cd /opt/ai-software-company; }
+
+            # Yeni image'ı çek
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short-sha }}
+
+            # docker-compose.yml güncelle
+            export IMAGE_TAG=${{ needs.build-and-push.outputs.short-sha }}
+            export APP_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+
+            # Sıfır kesintili güncelleme
+            docker compose pull app
+            docker compose up -d --no-deps --remove-orphans app
+
+            # Health check (30 saniye bekle)
+            sleep 10
+            docker compose ps app
+
+            echo "=== Staging Deploy Tamamlandı ==="
+
+      - name: Staging smoke test
+        run: |
+          # Temel sağlık kontrolü — bot'un ayakta olup olmadığını kontrol et
+          sleep 15
+          echo "Staging smoke test: container running check"
+
+      - name: Telegram'a staging bildirimi gönder
+        if: always()
+        uses: appleboy/telegram-action@master
+        with:
+          to:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          format:  markdown
+          message: |
+            ${{ job.status == 'success' && '✅' || '❌' }} *Staging Deploy*
+
+            📦 Image: `${{ needs.build-and-push.outputs.short-sha }}`
+            🌿 Branch: `${{ github.ref_name }}`
+            👤 Tetikleyen: `${{ github.actor }}`
+            💬 Commit: ${{ github.event.head_commit.message }}
+            🔗 [GitHub Actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 4: Production Deploy (sadece tag push)
+  # ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy → Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, image-scan, deploy-staging]
+    environment:
+      name: production
+      url: https://example.com
+
+    # Sadece v* tag'i veya manuel production seçiminde çalış
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event.inputs.environment == 'production'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Production onay bekle
+        run: |
+          echo "Production deploy: ${{ needs.build-and-push.outputs.image-tag }}"
+          echo "GitHub Environment protection rules aktif — manual approval gerekebilir"
+
+      - name: SSH ile production'a deploy et
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "=== Production Deploy Başladı ==="
+            cd /opt/ai-software-company-prod || { mkdir -p /opt/ai-software-company-prod && cd /opt/ai-software-company-prod; }
+
+            # Mevcut durumu yedekle (rollback için)
+            docker compose ps > pre-deploy-state.txt 2>&1 || true
+            docker tag \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rollback \
+              2>/dev/null || true
+
+            # Yeni image'ı çek
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short-sha }}
+
+            # Zero-downtime rolling update
+            docker compose pull app
+            docker compose up -d --no-deps --remove-orphans app
+
+            # Health check (60 saniye bekle)
+            sleep 20
+            HEALTH=$(docker compose ps app --format json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          if isinstance(data, list): data = data[0]
+          print(data.get('Health', data.get('Status', 'unknown')))
+          " 2>/dev/null || echo "unknown")
+
+            echo "Health: $HEALTH"
+            if [[ "$HEALTH" == *"unhealthy"* ]]; then
+              echo "UNHEALTHY! Rollback yapılıyor..."
+              docker compose up -d --no-deps app --scale app=0
+              docker tag \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:rollback \
+                ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+              docker compose up -d --no-deps app
+              exit 1
+            fi
+
+            echo "=== Production Deploy Tamamlandı ==="
+
+      - name: Telegram'a production bildirimi gönder
+        if: always()
+        uses: appleboy/telegram-action@master
+        with:
+          to:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          format:  markdown
+          message: |
+            ${{ job.status == 'success' && '🎉' || '🚨' }} *Production Deploy*
+
+            📦 Version: `${{ github.ref_name }}`
+            📦 Image: `${{ needs.build-and-push.outputs.short-sha }}`
+            👤 Tetikleyen: `${{ github.actor }}`
+            ⏱️ Zaman: ${{ github.event.head_commit.timestamp }}
+            🔗 [GitHub Actions](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})

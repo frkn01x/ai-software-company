@@ -1,0 +1,43 @@
+# Secret'lar — ASLA commit'leme!
+.env
+.env.local
+state/config.json
+
+# Runtime state dosyaları — commit'leme
+state/project_state.json
+state/*.db
+state/latest_kickoff_task_outputs.db
+state/long_term_memory_storage.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# Loglar
+logs/
+*.log
+
+# Proje çıktıları (ajanlar tarafından üretilir, commit'leme)
+output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
